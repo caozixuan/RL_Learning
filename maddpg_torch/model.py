@@ -6,6 +6,7 @@ from memory import Memory
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
+# Actor被设定为一个三层全连接神经网络，输出为(-1,1)
 class Actor(nn.Module):
 
     def __init__(self, state_dim, action_dim, n_hidden_1, n_hidden_2):
@@ -21,6 +22,7 @@ class Actor(nn.Module):
         return x
 
 
+# Critic被设定为一个三层全连接神经网络，输出为一个linear值(这里不使用tanh函数是因为原始的奖励没有取值范围的限制)
 class Critic(nn.Module):
 
     def __init__(self, state_dim, action_dim, n_hidden_1, n_hidden_2):
@@ -30,43 +32,42 @@ class Critic(nn.Module):
         self.layer3 = nn.Sequential(nn.Linear(n_hidden_2, 1))
 
     def forward(self, sa):
-        sa = sa.reshape(sa.size()[0], sa.size()[1] * sa.size()[2])
+        sa = sa.reshape(sa.size()[0], sa.size()[1] * sa.size()[2])   # 对于传入的s(环境)和a(动作)要展平
         x = self.layer1(sa)
         x = self.layer2(x)
         x = self.layer3(x)
         return x
 
 
+# 梯度下降参数
 LR_C = 1e-3
 LR_A = 1e-3
 
 
+# 在DDPG中，训练网络的参数不是直接复制给目标网络的，而是一个软更新的过程，也就是 v_new = (1-tau) * v_old + tau * v_new
 def soft_update(net_target, net, tau):
     for target_param, param in zip(net_target.parameters(), net.parameters()):
         target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
 
 
-def get_array(array):
-    res = [x for y in array for x in y]
-    return res
-
-
 class DDPGAgent(object):
 
     def __init__(self, index, memory_size, batch_size, gamma, state_global, action_global, local=False):
+        self.hidden = 200
         self.memory = Memory(memory_size)
         self.state_dim = state_global[index]
         self.action_dim = action_global[index]
-        self.Actor = Actor(self.state_dim, self.action_dim, 100, 100).to(device)
+        self.Actor = Actor(self.state_dim, self.action_dim, self.hidden, self.hidden).to(device)
+        # local决定是用局部信息还是全局信息，也决定是DDPG算法还是MADDPG算法
         if not local:
-            self.Critic = Critic(sum(state_global), sum(action_global), 100, 100).to(device)
+            self.Critic = Critic(sum(state_global), sum(action_global), self.hidden, self.hidden).to(device)
         else:
-            self.Critic = Critic(self.state_dim, self.action_dim, 100, 100).to(device)
-        self.Actor_target = Actor(self.state_dim, self.action_dim, 100, 100).to(device)
+            self.Critic = Critic(self.state_dim, self.action_dim, self.hidden, self.hidden).to(device)
+        self.Actor_target = Actor(self.state_dim, self.action_dim, self.hidden, self.hidden).to(device)
         if not local:
-            self.Critic_target = Critic(sum(state_global), sum(action_global), 100, 100).to(device)
+            self.Critic_target = Critic(sum(state_global), sum(action_global), self.hidden, self.hidden).to(device)
         else:
-            self.Critic_target = Critic(self.state_dim, self.action_dim, 100, 100).to(device)
+            self.Critic_target = Critic(self.state_dim, self.action_dim, self.hidden, self.hidden).to(device)
         self.critic_train = torch.optim.Adam(self.Critic.parameters(), lr=LR_C)
         self.actor_train = torch.optim.Adam(self.Actor.parameters(), lr=LR_A)
         self.loss_td = nn.MSELoss()
@@ -75,9 +76,16 @@ class DDPGAgent(object):
         self.tau = 0.5
         self.local = local
 
+    # 输出确定行为
     def act(self, s):
-        s = torch.unsqueeze(torch.FloatTensor(s), 0)
-        return self.Actor(s)[0].detach()
+        return self.Actor(s)
+
+    # 输出带噪声的行为
+    def act_prob(self, s):
+        a = self.Actor(s)
+        noise = torch.normal(mean=0.0, std=torch.Tensor(size=([len(a)])).fill_(0.02)).to(device)
+        a_noise = a + noise
+        return a_noise
 
 
 class MADDPG(object):
@@ -92,15 +100,18 @@ class MADDPG(object):
         curr_agent = self.agents[index]
         curr_agent.critic_train.zero_grad()
         all_target_actions = []
+        # 根据局部观测值输出动作目标网络的动作
         for i in range(0, self.n):
             action = curr_agent.Actor_target(next_obs[:, i])
             all_target_actions.append(action)
-        test = torch.cat(all_target_actions, dim=0).to(device).reshape(actions.size()[0], actions.size()[1],
+        action_target_all = torch.cat(all_target_actions, dim=0).to(device).reshape(actions.size()[0], actions.size()[1],
                                                                        actions.size()[2])
-        target_vf_in = torch.cat((next_obs, test), dim=2)
+        target_vf_in = torch.cat((next_obs, action_target_all), dim=2)
+        # 计算在目标网络下，基于贝尔曼方程得到当前情况的评价
         target_value = rewards[:, index] + self.gamma * curr_agent.Critic_target(target_vf_in).squeeze(dim=1)
         vf_in = torch.cat((observations, actions), dim=2)
         actual_value = curr_agent.Critic(vf_in).squeeze(dim=1)
+        # 计算针对Critic的损失函数
         vf_loss = curr_agent.loss_td(actual_value, target_value.detach())
 
         vf_loss.backward()
@@ -118,6 +129,7 @@ class MADDPG(object):
         vf_in = torch.cat((observations,
                            torch.cat(all_pol_acs, dim=0).to(device).reshape(actions.size()[0], actions.size()[1],
                                                                             actions.size()[2])), dim=2)
+        # DDPG中针对Actor的损失函数
         pol_loss = -torch.mean(curr_agent.Critic(vf_in))
         pol_loss.backward()
         curr_agent.actor_train.step()
@@ -133,3 +145,19 @@ class MADDPG(object):
 
     def add_data(self, s, a, r, s_, done):
         self.memory.add(s, a, r, s_, done)
+
+    def save_model(self, episode):
+        for i in range(0, self.n):
+            model_name_c = "Critic_Agent" + str(i) + "_" + str(episode) + ".pt"
+            model_name_a = "Actor_Agent" + str(i) + "_" + str(episode) + ".pt"
+            torch.save(self.agents[i].Critic_target, 'model_tag/' + model_name_c)
+            torch.save(self.agents[i].Actor_target, 'model_tag/' + model_name_a)
+
+    def load_model(self, episode):
+        for i in range(0, self.n):
+            model_name_c = "Critic_Agent" + str(i) + "_" + str(episode) + ".pt"
+            model_name_a = "Actor_Agent" + str(i) + "_" + str(episode) + ".pt"
+            self.agents[i].Critic_target = torch.load("model_tag/" + model_name_c)
+            self.agents[i].Critic = torch.load("model_tag/" + model_name_c)
+            self.agents[i].Actor_target = torch.load("model_tag/" + model_name_a)
+            self.agents[i].Actor = torch.load("model_tag/" + model_name_a)

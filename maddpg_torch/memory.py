@@ -4,6 +4,7 @@ import torch
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
+# 存储历史状态
 class Memory(object):
 
     def __init__(self, size):
@@ -26,6 +27,7 @@ class Memory(object):
     def make_index(self, batch_size):
         return [random.randint(0, len(self.memory) - 1) for _ in range(batch_size)]
 
+    # 将数据转化为pytorch tensor
     def encode(self, ids):
         s, a, r, s_, dones = [], [], [], [], []
         for i in ids:
